@@ -3,28 +3,55 @@ import typing
 
 from strategies.random_safe import RandomSafeStrategy
 from strategies.food_seeker import FoodSeekerStrategy
+from strategies.minimax import MinimaxStrategy
 
 STRATEGY_FILE = os.environ.get(
     "STRATEGY_FILE", "/home/ubuntu/Battlesnake_first_attempt/strategy.txt"
 )
-DEFAULT_STRATEGY = "food_seeker"
+DEFAULT_STRATEGY = "minimax"
+VALID_GAME_MODES = {"standard", "constrictor", "royale"}
 
 STRATEGIES = {
     "random_safe": RandomSafeStrategy(),
     "food_seeker": FoodSeekerStrategy(),
-    # add more as you build them: "flood_fill", "minimax", etc.
+    "minimax": MinimaxStrategy(),
 }
 
 
-def get_current_strategy_name() -> str:
+def get_current_config() -> typing.Tuple[str, typing.Optional[str]]:
+    """Reads strategy.txt. Format is up to two lines:
+        line 1: strategy name (e.g. "minimax")
+        line 2 (optional): game mode override ("standard", "constrictor",
+                            or "royale")
+    If line 2 is missing or invalid, the game mode is auto-detected from
+    the real game_state's own ruleset on each move instead -- the file
+    override exists mainly for forcing a mode during local CLI testing.
+    Returns (strategy_name, game_mode_override_or_None)."""
+    strategy_name = DEFAULT_STRATEGY
+    mode_override = None
     try:
         with open(STRATEGY_FILE) as f:
-            name = f.read().strip()
-            if name in STRATEGIES:
-                return name
+            lines = [line.strip() for line in f.readlines()]
     except FileNotFoundError:
-        pass
-    return DEFAULT_STRATEGY
+        return strategy_name, mode_override
+
+    if lines and lines[0] in STRATEGIES:
+        strategy_name = lines[0]
+    if len(lines) > 1 and lines[1] in VALID_GAME_MODES:
+        mode_override = lines[1]
+
+    return strategy_name, mode_override
+
+
+def get_game_mode(game_state: typing.Dict, mode_override: typing.Optional[str]) -> str:
+    """The strategy.txt override wins if present; otherwise auto-detect
+    from the real ruleset name Battlesnake sends with every request."""
+    if mode_override:
+        return mode_override
+    ruleset_name = game_state.get("game", {}).get("ruleset", {}).get("name", "standard")
+    if ruleset_name in VALID_GAME_MODES:
+        return ruleset_name
+    return "standard"
 
 
 def info() -> typing.Dict:
@@ -80,7 +107,7 @@ def flood_fill_area(start, board_width, board_height, occupied, max_cells=None):
     return count
 
 
-def compute_safe_moves(game_state: typing.Dict):
+def compute_safe_moves(game_state: typing.Dict, game_mode: str = "standard"):
     """Hazard logic every strategy needs: bounds, collisions, head-to-head,
     and dead-end (flood fill) avoidance.
     Returns (safe_moves: list[str], candidates: dict[str, {x,y}],
@@ -117,7 +144,7 @@ def compute_safe_moves(game_state: typing.Dict):
         if not (0 <= coord["x"] < board_width and 0 <= coord["y"] < board_height):
             is_move_safe[direction] = False
 
-    # Self + other snake collisions (full bodies, tails included —
+    # Self + other snake collisions (full bodies, tails included --
     # conservative for the immediate-collision check)
     occupied_full = set()
     for snake in all_snakes:
@@ -144,12 +171,14 @@ def compute_safe_moves(game_state: typing.Dict):
 
     # --- Flood fill / dead-end avoidance ---
     # Tails usually vacate next turn, so exclude them from the flood-fill
-    # obstacle set. This is a simplification (a snake that just ate won't
-    # shrink), but it's a reasonable default.
+    # obstacle set -- EXCEPT in constrictor, where snakes never shrink and
+    # tails are permanent obstacles.
+    tails_vacate = game_mode != "constrictor"
     occupied_for_flood = set()
     for snake in all_snakes:
         body = snake["body"]
-        for segment in body[:-1]:  # exclude tail
+        segments = body[:-1] if tails_vacate else body
+        for segment in segments:
             occupied_for_flood.add((segment["x"], segment["y"]))
 
     space_scores = {}
@@ -174,17 +203,19 @@ def compute_safe_moves(game_state: typing.Dict):
 
 
 def move(game_state: typing.Dict) -> typing.Dict:
-    safe_moves, candidates, space_scores = compute_safe_moves(game_state)
+    strategy_name, mode_override = get_current_config()
+    game_mode = get_game_mode(game_state, mode_override)
+
+    safe_moves, candidates, space_scores = compute_safe_moves(game_state, game_mode)
 
     if not safe_moves:
         print(f"MOVE {game_state['turn']}: No safe moves detected! Moving down")
         return {"move": "down"}
 
-    strategy_name = get_current_strategy_name()
     strategy = STRATEGIES[strategy_name]
-    next_move = strategy.choose_move(game_state, safe_moves, candidates, space_scores)
+    next_move = strategy.choose_move(game_state, safe_moves, candidates, space_scores, game_mode)
 
-    print(f"MOVE {game_state['turn']}: {next_move} ({strategy_name}) scores={space_scores}")
+    print(f"MOVE {game_state['turn']}: {next_move} ({strategy_name}, {game_mode}) scores={space_scores}")
     return {"move": next_move}
 
 

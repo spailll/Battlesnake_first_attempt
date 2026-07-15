@@ -4,7 +4,7 @@ from .base import Strategy
 
 
 class FoodSeekerStrategy(Strategy):
-    def choose_move(self, game_state, safe_moves, candidates, space_scores):
+    def choose_move(self, game_state, safe_moves, candidates, space_scores, game_mode="standard"):
         my_head = game_state["you"]["body"][0]
         food = game_state["board"]["food"]
 
