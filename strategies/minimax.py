@@ -21,9 +21,9 @@ LENGTH_WEIGHT = 20            # reward per segment longer than the biggest oppon
 HEALTH_CRITICAL_THRESHOLD = 30
 HEALTH_PENALTY_WEIGHT = 5     # penalty scaling once health drops below the threshold
 
-FOOD_BASE_WEIGHT = 8          # small constant pull toward food even at full health
+FOOD_BASE_WEIGHT = 128        # small constant pull toward food even at full health
 FOOD_LOW_HEALTH_THRESHOLD = 50
-FOOD_URGENCY_WEIGHT = 12      # extra pull toward food per missing health point below the threshold
+FOOD_URGENCY_WEIGHT = 192     # extra pull toward food per missing health point below the threshold
 
 # Constrictor has no food and no starvation -- the entire game is board
 # control, so territory matters even more than in standard play.
@@ -71,6 +71,12 @@ class MinimaxStrategy(Strategy):
     branching factor manageable.
     """
 
+    def __init__(self):
+        # Populated on every choose_move call; main.py reads this after the
+        # fact to log a full breakdown of what the search saw, without
+        # changing the actual decision logic at all.
+        self.last_diagnostics = {}
+
     def choose_move(self, game_state, safe_moves, candidates, space_scores, game_mode="standard"):
         if not safe_moves:
             return "up"
@@ -82,17 +88,55 @@ class MinimaxStrategy(Strategy):
             return safe_moves[0]
 
         start_time = time.time()
-        best_move = safe_moves[0]
+        # Fallback if the search somehow completes zero depths: pick the
+        # safe move with the most open space rather than an arbitrary one.
+        if space_scores:
+            best_move = max(safe_moves, key=lambda m: space_scores.get(m, 0))
+        else:
+            best_move = safe_moves[0]
         depth = 1
+        depth_reached = 0
+        last_root_scores = {}
 
         while time.time() - start_time < TIME_BUDGET_SECONDS and depth <= MAX_DEPTH:
             try:
-                move = self._search_root(state, my_id, depth, start_time)
+                move, root_scores = self._search_root(state, my_id, depth, start_time)
                 if move is not None:
                     best_move = move
+                    depth_reached = depth
+                    last_root_scores = root_scores
                 depth += 1
             except TimeBudgetExceeded:
                 break
+
+        search_elapsed = time.time() - start_time
+
+        # One-ply component breakdown for every safe move, for logging only.
+        # This does NOT affect the decision. Guarded by a time check so this
+        # diagnostic-only work can never push a real move past the actual
+        # deadline -- if the search already used most of the budget, skip it
+        # rather than risk a late response in a real tournament.
+        breakdown = {}
+        if search_elapsed < TIME_BUDGET_SECONDS * 0.7:
+            opponent_ids = [sid for sid in state["snakes"] if sid != my_id]
+            for direction in legal_moves(state, my_id):
+                fixed_moves = {sid: (legal_moves(state, sid) or ["up"])[0] for sid in opponent_ids}
+                next_state = apply_moves(state, {my_id: direction, **fixed_moves})
+                if my_id in next_state["snakes"]:
+                    breakdown[direction] = self._evaluate_components(next_state, my_id)
+                else:
+                    breakdown[direction] = {"total": -1_000_000, "dead": True}
+
+        total_elapsed = time.time() - start_time
+
+        self.last_diagnostics = {
+            "depth_reached": depth_reached,
+            "root_scores": last_root_scores,
+            "one_ply_breakdown": breakdown,
+            "chosen_move": best_move,
+            "search_elapsed_ms": round(search_elapsed * 1000, 1),
+            "total_elapsed_ms": round(total_elapsed * 1000, 1),
+        }
 
         return best_move
 
@@ -106,10 +150,11 @@ class MinimaxStrategy(Strategy):
         alpha, beta = float("-inf"), float("inf")
         best_score = float("-inf")
         best_move = None
+        scores = {}
 
         moves = legal_moves(state, my_id)
         if not moves:
-            return None
+            return None, scores
 
         my_head = state["snakes"][my_id]["body"][0]
         food_cells = state["food"]
@@ -122,6 +167,7 @@ class MinimaxStrategy(Strategy):
             landing_cell = (my_head[0] + dx, my_head[1] + dy)
             bonus = IMMEDIATE_EAT_BONUS if landing_cell in food_cells else 0
             display_score = raw_score + bonus
+            scores[direction] = {"raw_score": raw_score, "eat_bonus": bonus}
 
             if display_score > best_score:
                 best_score = display_score
@@ -131,7 +177,7 @@ class MinimaxStrategy(Strategy):
             # legitimate competing branch too aggressively.
             alpha = max(alpha, raw_score)
 
-        return best_move
+        return best_move, scores
 
     def _max_node(self, state, my_id, depth, alpha, beta, start_time):
         self._check_time(start_time)
@@ -143,8 +189,6 @@ class MinimaxStrategy(Strategy):
 
         moves = legal_moves(state, my_id)
         if not moves:
-            # No non-reversing move available; snake is almost certainly
-            # about to die -- score the current state as-is.
             return self._evaluate(state, my_id)
 
         best = float("-inf")
@@ -174,10 +218,6 @@ class MinimaxStrategy(Strategy):
             if dist <= OPPONENT_CONSIDERATION_RADIUS:
                 nearby_ids.append(sid)
             else:
-                # Too far away to threaten us this turn. Give it one
-                # reasonable move rather than exhaustively searching all of
-                # its options and assuming the worst -- this keeps distant
-                # snakes from making the search irrationally cautious.
                 opts = legal_moves(state, sid) or ["up"]
                 fixed_moves[sid] = opts[0]
 
@@ -205,12 +245,17 @@ class MinimaxStrategy(Strategy):
     # ---- evaluation ----
 
     def _evaluate(self, state, my_id):
+        return self._evaluate_components(state, my_id)["total"]
+
+    def _evaluate_components(self, state, my_id):
+        """Same scoring as _evaluate, but returns every term separately so
+        it can be logged/inspected. Always includes a "total" key."""
         if my_id not in state["snakes"]:
-            return -1_000_000
+            return {"total": -1_000_000, "dead": True}
 
         opponents = [sid for sid in state["snakes"] if sid != my_id]
         if not opponents:
-            return 1_000_000  # last snake standing
+            return {"total": 1_000_000, "last_snake_standing": True}
 
         mode = state.get("mode", "standard")
         my_snake = state["snakes"][my_id]
@@ -220,21 +265,23 @@ class MinimaxStrategy(Strategy):
         length_diff = my_length - longest_opponent
 
         if mode == "constrictor":
-            # No food, no starvation -- the entire game is board control.
-            # Health/food terms would be meaningless noise here.
-            return (my_area - opp_area) * CONSTRICTOR_VORONOI_WEIGHT + length_diff * LENGTH_WEIGHT
+            voronoi_term = (my_area - opp_area) * CONSTRICTOR_VORONOI_WEIGHT
+            length_term = length_diff * LENGTH_WEIGHT
+            return {
+                "mode": mode,
+                "my_area": my_area,
+                "opp_area": opp_area,
+                "voronoi_term": voronoi_term,
+                "length_diff": length_diff,
+                "length_term": length_term,
+                "total": voronoi_term + length_term,
+            }
 
         health = my_snake["health"]
-        # Penalize low health increasingly as it approaches zero
         health_score = 0
         if health < HEALTH_CRITICAL_THRESHOLD:
             health_score = (health - HEALTH_CRITICAL_THRESHOLD) * HEALTH_PENALTY_WEIGHT
 
-        # Food term: closer to the nearest food is better. Weight ramps up
-        # as health drops, so it's a mild preference at full health and a
-        # strong pull once starving. Manhattan distance is a cheap
-        # approximation (ignores walls/other snakes) but is fine here since
-        # it's only used as a soft tiebreaker, not a safety check.
         food = state["food"]
         my_head = my_snake["body"][0]
         if food:
@@ -250,19 +297,29 @@ class MinimaxStrategy(Strategy):
 
         food_score = -nearest_food_dist * food_weight
 
-        # Royale: extra nudge to avoid lingering in a hazard cell right now,
-        # on top of the health cost already reflected via simulation.
         hazard_score = 0
         if mode == "royale":
             hazards = state.get("hazards", set())
             if my_head in hazards:
                 hazard_score = -ROYALE_HAZARD_PENALTY
 
-        score = (
-            (my_area - opp_area) * VORONOI_WEIGHT
-            + length_diff * LENGTH_WEIGHT
-            + health_score
-            + food_score
-            + hazard_score
-        )
-        return score
+        voronoi_term = (my_area - opp_area) * VORONOI_WEIGHT
+        length_term = length_diff * LENGTH_WEIGHT
+
+        total = voronoi_term + length_term + health_score + food_score + hazard_score
+
+        return {
+            "mode": mode,
+            "my_area": my_area,
+            "opp_area": opp_area,
+            "voronoi_term": voronoi_term,
+            "length_diff": length_diff,
+            "length_term": length_term,
+            "health": health,
+            "health_score": health_score,
+            "nearest_food_dist": nearest_food_dist,
+            "food_weight": food_weight,
+            "food_score": food_score,
+            "hazard_score": hazard_score,
+            "total": total,
+        }

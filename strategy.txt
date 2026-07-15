@@ -1,2 +1,2 @@
 minmax
-constrictor
+standard

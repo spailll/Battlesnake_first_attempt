@@ -1,3 +1,4 @@
+import json
 import os
 import typing
 
@@ -7,6 +8,9 @@ from strategies.minimax import MinimaxStrategy
 
 STRATEGY_FILE = os.environ.get(
     "STRATEGY_FILE", "/home/ubuntu/Battlesnake_first_attempt/strategy.txt"
+)
+LOG_FILE = os.environ.get(
+    "LOG_FILE", "/home/ubuntu/Battlesnake_first_attempt/latest_game_log.jsonl"
 )
 DEFAULT_STRATEGY = "minimax"
 VALID_GAME_MODES = {"standard", "constrictor", "royale"}
@@ -46,12 +50,21 @@ def get_current_config() -> typing.Tuple[str, typing.Optional[str]]:
 def get_game_mode(game_state: typing.Dict, mode_override: typing.Optional[str]) -> str:
     """The strategy.txt override wins if present; otherwise auto-detect
     from the real ruleset name Battlesnake sends with every request."""
-    if mode_override:
-        return mode_override
     ruleset_name = game_state.get("game", {}).get("ruleset", {}).get("name", "standard")
-    if ruleset_name in VALID_GAME_MODES:
-        return ruleset_name
-    return "standard"
+    if ruleset_name not in VALID_GAME_MODES:
+        ruleset_name = "standard"
+
+    if mode_override:
+        if mode_override != ruleset_name:
+            print(
+                f"WARNING: strategy.txt forces game_mode='{mode_override}' but the "
+                f"real ruleset for this match is '{ruleset_name}'. If this isn't "
+                f"intentional (e.g. local CLI testing), remove the second line of "
+                f"strategy.txt so it auto-detects correctly."
+            )
+        return mode_override
+
+    return ruleset_name
 
 
 def info() -> typing.Dict:
@@ -67,6 +80,15 @@ def info() -> typing.Dict:
 
 def start(game_state: typing.Dict):
     print("GAME START")
+    try:
+        with open(LOG_FILE, "w") as f:
+            f.write(json.dumps({
+                "event": "game_start",
+                "game_id": game_state.get("game", {}).get("id"),
+                "ruleset": game_state.get("game", {}).get("ruleset", {}).get("name"),
+            }) + "\n")
+    except OSError as e:
+        print(f"WARNING: could not initialize log file: {e}")
 
 
 def end(game_state: typing.Dict):
@@ -202,6 +224,46 @@ def compute_safe_moves(game_state: typing.Dict, game_mode: str = "standard"):
     return safe_moves, candidates, space_scores
 
 
+def log_turn(game_state, strategy_name, game_mode, safe_moves, space_scores, next_move, strategy):
+    """Append one line of JSON describing this turn's decision to LOG_FILE.
+    Never allowed to raise -- a logging failure must never break gameplay."""
+    try:
+        real_ruleset = game_state.get("game", {}).get("ruleset", {}).get("name", "standard")
+        record = {
+            "event": "turn",
+            "turn": game_state.get("turn"),
+            "strategy": strategy_name,
+            "game_mode": game_mode,
+            "real_ruleset": real_ruleset,
+            "mode_mismatch": game_mode != real_ruleset,
+            "chosen_move": next_move,
+            "safe_moves": safe_moves,
+            "space_scores": space_scores,
+            "my_health": game_state["you"]["health"],
+            "my_length": len(game_state["you"]["body"]),
+            "my_head": game_state["you"]["body"][0],
+            "food": game_state["board"]["food"],
+            "hazards": game_state["board"].get("hazards", []),
+            "snakes": [
+                {
+                    "id": s["id"],
+                    "health": s["health"],
+                    "length": len(s["body"]),
+                    "head": s["body"][0],
+                }
+                for s in game_state["board"]["snakes"]
+            ],
+            # Populated only by strategies that track it (currently
+            # MinimaxStrategy); safely empty for others.
+            "diagnostics": getattr(strategy, "last_diagnostics", {}),
+        }
+        with open(LOG_FILE, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as e:
+        # Logging must never take down the actual game response.
+        print(f"WARNING: failed to write turn log: {e}")
+
+
 def move(game_state: typing.Dict) -> typing.Dict:
     strategy_name, mode_override = get_current_config()
     game_mode = get_game_mode(game_state, mode_override)
@@ -213,9 +275,24 @@ def move(game_state: typing.Dict) -> typing.Dict:
         return {"move": "down"}
 
     strategy = STRATEGIES[strategy_name]
-    next_move = strategy.choose_move(game_state, safe_moves, candidates, space_scores, game_mode)
+
+    try:
+        next_move = strategy.choose_move(game_state, safe_moves, candidates, space_scores, game_mode)
+        if next_move not in safe_moves:
+            # Defensive: a strategy bug returning something outside the
+            # precomputed safe set should never take down the response.
+            print(f"WARNING: strategy returned '{next_move}', not in safe_moves {safe_moves}; overriding")
+            next_move = max(safe_moves, key=lambda m: space_scores.get(m, 0))
+    except Exception as e:
+        # A crash in strategy logic must never forfeit the turn. Fall back
+        # to the safe move with the most open space.
+        print(f"WARNING: strategy raised {type(e).__name__}: {e}; falling back to safest move")
+        next_move = max(safe_moves, key=lambda m: space_scores.get(m, 0))
 
     print(f"MOVE {game_state['turn']}: {next_move} ({strategy_name}, {game_mode}) scores={space_scores}")
+
+    log_turn(game_state, strategy_name, game_mode, safe_moves, space_scores, next_move, strategy)
+
     return {"move": next_move}
 
 
